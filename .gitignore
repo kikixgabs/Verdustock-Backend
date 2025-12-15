@@ -3,4 +3,5 @@
 .env.production
 bin/
 dist/
+register_user.ps1
 *.exe
