@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -90,28 +91,21 @@ func AuthMiddleware() gin.HandlerFunc {
 
 // Corrección de la Cookie
 func SetAuthCookie(c *gin.Context, tokenString string, duration time.Duration) {
-	// Leemos si estamos en prod o dev
-	appEnv := os.Getenv("APP_ENV")
-
+	env := os.Getenv("APP_ENV")
 	maxAge := int(duration.Seconds())
 
-	// IMPORTANTE: Dejar domain vacío.
-	// Si pones "verdustock.onrender.com" a veces falla. Dejarlo vacío es más seguro.
-	domain := ""
+	if env == "production" {
+		// EN PRODUCCIÓN: Construcción manual para incluir "Partitioned"
+		// Esto elimina el warning de Chrome y asegura compatibilidad futura (CHIPS).
+		// Formato: Name=Value; Path=/; Max-Age=N; HttpOnly; Secure; SameSite=None; Partitioned
+		cookieValue := fmt.Sprintf("token=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=None; Partitioned", tokenString, maxAge)
 
-	secure := false
-	httpOnly := true // Esto hace que sea invisible para el JS del frontend
-
-	var sameSite http.SameSite
-
-	if appEnv == "production" {
-		secure = true                    // Obligatorio para SameSite=None
-		sameSite = http.SameSiteNoneMode // Obligatorio para compartir entre dominios distintos
+		// Usamos "Add" para setear el header directamente
+		c.Writer.Header().Add("Set-Cookie", cookieValue)
 	} else {
-		sameSite = http.SameSiteLaxMode
+		// EN DESARROLLO (Localhost): Usamos el método estándar de Gin
+		// Aquí no necesitamos Partitioned ni Secure estricto
+		c.SetSameSite(http.SameSiteLaxMode)
+		c.SetCookie("token", tokenString, maxAge, "/", "", false, true)
 	}
-
-	c.SetSameSite(sameSite)
-	// La firma es: name, value, maxAge, path, domain, secure, httpOnly
-	c.SetCookie("token", tokenString, maxAge, "/", domain, secure, httpOnly)
 }
