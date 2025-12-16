@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,16 +23,36 @@ func GetSecret() []byte {
 
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tokenString, err := c.Cookie("token")
-		if err != nil || tokenString == "" {
+		var tokenString string
+		var err error
+
+		// 1. INTENTO PRINCIPAL: Buscar en el Header "Authorization" (Estándar para Apps Web)
+		authHeader := c.GetHeader("Authorization")
+		if authHeader != "" {
+			// El formato debe ser "Bearer <token>"
+			parts := strings.Split(authHeader, " ")
+			if len(parts) == 2 && parts[0] == "Bearer" {
+				tokenString = parts[1]
+			}
+		}
+
+		// 2. INTENTO SECUNDARIO: Si no hay header, buscar en Cookie (Fallback)
+		if tokenString == "" {
+			tokenString, err = c.Cookie("token")
+		}
+
+		// Si fallaron los dos métodos, abortar
+		if tokenString == "" || err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "No autorizado: token ausente"})
 			c.Abort()
 			return
 		}
 
+		// Parsear y validar el token
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			return GetSecret(), nil
 		})
+
 		if err != nil || !token.Valid {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token inválido o expirado"})
 			c.Abort()
@@ -67,23 +88,30 @@ func AuthMiddleware() gin.HandlerFunc {
 	}
 }
 
+// Corrección de la Cookie
 func SetAuthCookie(c *gin.Context, tokenString string, duration time.Duration) {
-	env := os.Getenv("APP_ENV")
+	// Leemos si estamos en prod o dev
+	appEnv := os.Getenv("APP_ENV")
 
 	maxAge := int(duration.Seconds())
+
+	// IMPORTANTE: Dejar domain vacío.
+	// Si pones "verdustock.onrender.com" a veces falla. Dejarlo vacío es más seguro.
 	domain := ""
+
 	secure := false
+	httpOnly := true // Esto hace que sea invisible para el JS del frontend
 
-	if env == "production" {
-		domain = "auth-backend-production-414c.up.railway.app"
-		secure = true
-	}
+	var sameSite http.SameSite
 
-	c.SetCookie("token", tokenString, maxAge, "/", domain, secure, true)
-
-	if env == "production" {
-		c.SetSameSite(http.SameSiteNoneMode)
+	if appEnv == "production" {
+		secure = true                    // Obligatorio para SameSite=None
+		sameSite = http.SameSiteNoneMode // Obligatorio para compartir entre dominios distintos
 	} else {
-		c.SetSameSite(http.SameSiteLaxMode)
+		sameSite = http.SameSiteLaxMode
 	}
+
+	c.SetSameSite(sameSite)
+	// La firma es: name, value, maxAge, path, domain, secure, httpOnly
+	c.SetCookie("token", tokenString, maxAge, "/", domain, secure, httpOnly)
 }

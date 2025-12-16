@@ -4,71 +4,89 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time" // Agregado para configurar el MaxAge de CORS
 
 	"verdustock-auth/database"
 	"verdustock-auth/handlers"
 	"verdustock-auth/middleware"
 
+	"github.com/gin-contrib/cors" // Librería oficial para CORS
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
 func main() {
 
+	// 1. Carga de variables de entorno
 	env := os.Getenv("APP_ENV")
 	if env == "" {
 		env = "development"
 	}
 
+	// Intentamos cargar archivos .env, pero si fallan (ej. en Render),
+	// seguimos adelante confiando en las variables del sistema.
 	if env == "development" {
 		if err := godotenv.Load(".env.development"); err != nil {
-			log.Println("⚠️ No se pudo cargar .env.development, usando variables del sistema")
+			log.Println("⚠️ Aviso: No hay .env.development, usando variables de sistema")
 		}
 	} else {
+		// En producción (Render), normalmente no subimos el .env.production,
+		// así que es normal que esto falle.
 		if err := godotenv.Load(".env.production"); err != nil {
-			log.Println("⚠️ No se pudo cargar .env.production, usando variables del sistema")
+			log.Println("ℹ️ Info: Corriendo con variables de entorno del sistema (Render)")
 		}
 	}
 
+	// 2. Inicialización de Secretos y Base de Datos
 	middleware.LoadSecret()
 
 	mongoURI := os.Getenv("MONGODB_URI")
 	dbName := os.Getenv("MONGODB_NAME")
 
+	if mongoURI == "" {
+		log.Fatal("❌ Error Fatal: MONGODB_URI no está definida")
+	}
+
 	database.Connect(mongoURI, dbName)
 
-	// Initialize Catalog if empty
+	// Inicializar catálogo si está vacío
 	if err := handlers.InitializeCatalog(); err != nil {
 		log.Println("⚠️ Advertencia: No se pudo inicializar el catálogo de productos:", err)
 	}
 
+	// 3. Configuración del Servidor y CORS
 	router := gin.Default()
 
-	allowedOrigins := []string{
-		"http://localhost:4200",
-		"https://kikixgabs.github.io",
+	// CONFIGURACIÓN ROBUSTA DE CORS
+	// Esto reemplaza tu función manual anterior.
+	config := cors.DefaultConfig()
+	config.AllowOrigins = []string{
+		"http://localhost:4200",       // Tu entorno local
+		"https://kikixgabs.github.io", // Tu producción
+	}
+	// Métodos permitidos
+	config.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+
+	// Headers permitidos (Agregamos X-Admin-Secret y Accept que faltaban)
+	config.AllowHeaders = []string{
+		"Origin",
+		"Content-Type",
+		"Accept",
+		"Authorization",
+		"X-Requested-With",
+		"X-Admin-Secret", // Necesario para tu script de admin
 	}
 
-	router.Use(func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
-		for _, o := range allowedOrigins {
-			if o == origin {
-				c.Writer.Header().Set("Access-Control-Allow-Origin", o)
-				break
-			}
-		}
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+	// CRÍTICO: Permitir cookies/credenciales
+	config.AllowCredentials = true
 
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
+	// Cachear la respuesta de preflight por 12 horas para mejorar rendimiento
+	config.MaxAge = 12 * time.Hour
 
-		c.Next()
-	})
+	// Aplicar el middleware
+	router.Use(cors.New(config))
 
+	// 4. Definición de Rutas
 	router.POST("/login", handlers.LoginHandler)
 	router.POST("/logout", handlers.LogoutHandler)
 
@@ -78,21 +96,23 @@ func main() {
 	// Webhooks
 	router.POST("/webhooks/mercadopago", handlers.HandleMPWebhook)
 
+	// Grupo User (Protegido)
 	userGroup := router.Group("/user")
 	userGroup.Use(middleware.AuthMiddleware())
 	{
 		userGroup.POST("/mercadopago/link", handlers.LinkMPAccountHandler)
 	}
 
+	// Grupo Stock (Protegido)
 	stockGroup := router.Group("/stock")
 	stockGroup.Use(middleware.AuthMiddleware())
 	{
 		stockGroup.GET("", handlers.GetStockHandler)
 		stockGroup.PUT("/:id", handlers.UpdateProductHandler)
 		stockGroup.POST("", handlers.CreateProductHandler)
-
 	}
 
+	// Grupo Ventas (Protegido)
 	sellsGroup := router.Group("/sells")
 	sellsGroup.Use(middleware.AuthMiddleware())
 	{
@@ -102,12 +122,13 @@ func main() {
 		sellsGroup.POST("/close", handlers.CloseBoxHandler)
 	}
 
+	// 5. Iniciar Servidor
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 		log.Println("INFO: PORT not set, defaulting to " + port)
 	}
 
-	fmt.Printf("🚀 Servidor corriendo en modo %s en http://localhost:%s\n", env, port)
+	fmt.Printf("🚀 Servidor corriendo en modo %s en puerto :%s\n", env, port)
 	router.Run(":" + port)
 }
