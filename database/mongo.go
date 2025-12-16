@@ -14,6 +14,7 @@ var UserCollection *mongo.Collection
 var StockCollection *mongo.Collection
 var CatalogCollection *mongo.Collection
 var SellsCollection *mongo.Collection
+var MPPaymentsCollection *mongo.Collection
 
 func Connect(uri string, dbName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -30,6 +31,7 @@ func Connect(uri string, dbName string) {
 	StockCollection = db.Collection("stock")
 	CatalogCollection = db.Collection("catalog")
 	SellsCollection = db.Collection("sells")
+	MPPaymentsCollection = db.Collection("mp_payments")
 }
 
 func GetCollection(name string) *mongo.Collection {

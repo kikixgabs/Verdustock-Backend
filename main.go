@@ -75,6 +75,15 @@ func main() {
 	router.GET("/auth/me", handlers.AuthMeHandler(database.UserCollection))
 	router.POST("/admin/create-user", handlers.AdminCreateUserHandler)
 
+	// Webhooks
+	router.POST("/webhooks/mercadopago", handlers.HandleMPWebhook)
+
+	userGroup := router.Group("/user")
+	userGroup.Use(middleware.AuthMiddleware())
+	{
+		userGroup.POST("/mercadopago/link", handlers.LinkMPAccountHandler)
+	}
+
 	stockGroup := router.Group("/stock")
 	stockGroup.Use(middleware.AuthMiddleware())
 	{

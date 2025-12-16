@@ -127,11 +127,12 @@ func AuthMeHandler(userCollection *mongo.Collection) gin.HandlerFunc {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"user": gin.H{
-				"id":       user.ID.Hex(),
-				"email":    user.Email,
-				"username": user.Username,
-				"theme":    user.Theme,
-				"language": user.Language,
+				"id":                 user.ID.Hex(),
+				"email":              user.Email,
+				"username":           user.Username,
+				"theme":              user.Theme,
+				"language":           user.Language,
+				"mpAccountConnected": user.MPAccountConnected,
 			},
 		})
 	}
