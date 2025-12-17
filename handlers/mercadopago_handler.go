@@ -18,12 +18,14 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// Estructuras auxiliares
+// Estructura actualizada para leer el user_id que manda MP
 type WebhookRequest struct {
-	Type string `json:"type"`
-	Data struct {
+	Type   string `json:"type"`
+	Action string `json:"action"`
+	Data   struct {
 		ID string `json:"id"`
 	} `json:"data"`
+	UserID int64 `json:"user_id"` // <--- EL DATO CLAVE QUE FALTABA
 }
 
 type PaymentResponse struct {
@@ -37,7 +39,6 @@ type PaymentResponse struct {
 	} `json:"payer"`
 }
 
-// Estructura para la respuesta de OAuth de Mercado Pago
 type MPOAuthResponse struct {
 	AccessToken  string `json:"access_token"`
 	TokenType    string `json:"token_type"`
@@ -49,10 +50,10 @@ type MPOAuthResponse struct {
 }
 
 // ==========================================
-// 1. LINK ACCOUNT HANDLER (Corregido OAuth)
+// 1. LINK ACCOUNT HANDLER (Igual que antes)
 // ==========================================
 func LinkMPAccountHandler(c *gin.Context) {
-	// Obtener ID del usuario logueado
+	// ... (Tu código de LinkMPAccountHandler estaba bien, déjalo igual o cópialo si quieres asegurarte)
 	userIDStr, exists := c.Get("userId")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
@@ -64,7 +65,6 @@ func LinkMPAccountHandler(c *gin.Context) {
 		return
 	}
 
-	// Recibimos SOLO el "code" del frontend
 	var input struct {
 		Code string `json:"code" binding:"required"`
 	}
@@ -73,12 +73,10 @@ func LinkMPAccountHandler(c *gin.Context) {
 		return
 	}
 
-	// Preparamos la petición a Mercado Pago para canjear el código
 	clientID := os.Getenv("MP_CLIENT_ID")
 	clientSecret := os.Getenv("MP_CLIENT_SECRET")
 	redirectURI := os.Getenv("MP_REDIRECT_URI")
 
-	// Formulario POST
 	data := url.Values{}
 	data.Set("client_id", clientID)
 	data.Set("client_secret", clientSecret)
@@ -86,7 +84,6 @@ func LinkMPAccountHandler(c *gin.Context) {
 	data.Set("code", input.Code)
 	data.Set("redirect_uri", redirectURI)
 
-	// Hacemos el POST a MP
 	resp, err := http.PostForm("https://api.mercadopago.com/oauth/token", data)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to connect to Mercado Pago"})
@@ -94,7 +91,6 @@ func LinkMPAccountHandler(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	// Si MP nos rechaza (ej: código viejo o inválido)
 	if resp.StatusCode != 200 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		fmt.Printf("❌ Error MP OAuth: %s\n", string(bodyBytes))
@@ -102,18 +98,15 @@ func LinkMPAccountHandler(c *gin.Context) {
 		return
 	}
 
-	// Decodificamos los tokens
 	var mpData MPOAuthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&mpData); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse MP response"})
 		return
 	}
 
-	// Guardamos en la Base de Datos
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Construimos el objeto MPAccount
 	mpAccount := models.MPAccount{
 		AccessToken:  mpData.AccessToken,
 		RefreshToken: mpData.RefreshToken,
@@ -140,108 +133,96 @@ func LinkMPAccountHandler(c *gin.Context) {
 }
 
 // ==========================================
-// 2. WEBHOOK HANDLER
+// 2. WEBHOOK HANDLER (¡CORREGIDO!)
 // ==========================================
 func HandleMPWebhook(c *gin.Context) {
-	// 1. Identificar Usuario via Query Param (?userId=...)
-	userIDStr := c.Query("userId")
-	if userIDStr == "" {
-		// Importante: Responder 200 a MP aunque falte el ID para que no reintenten infinitamente
-		c.JSON(http.StatusOK, gin.H{"error": "userId query param missing (ignored)"})
-		return
-	}
-
-	userID, err := primitive.ObjectIDFromHex(userIDStr)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"error": "Invalid userId (ignored)"})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Buscar usuario para obtener su Access Token
-	var user models.User
-	err = database.UserCollection.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"error": "User not found (ignored)"})
-		return
-	}
-
-	// Verificamos que tenga cuenta vinculada y token
-	if user.MPAccount == nil || user.MPAccount.AccessToken == "" {
-		c.JSON(http.StatusOK, gin.H{"error": "User has not configured MP Access Token"})
-		return
-	}
-
-	// 2. Parsear Webhook
+	// 1. Parsear el Webhook (Ahora leemos UserID del JSON)
 	var req WebhookRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid webhook payload"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Payload inválido"})
 		return
 	}
 
-	// Solo nos interesan pagos
-	if req.Type != "payment" {
-		c.JSON(http.StatusOK, gin.H{"message": "Ignored non-payment event"})
+	// Logs para debug en Render
+	fmt.Printf("🔔 Webhook Recibido - Type: %s, Action: %s, UserID: %d, DataID: %s\n", req.Type, req.Action, req.UserID, req.Data.ID)
+
+	// Solo nos interesan los eventos de pago
+	if req.Type != "payment" && req.Action != "payment.created" && req.Action != "payment.updated" {
+		c.JSON(http.StatusOK, gin.H{"message": "Evento ignorado"})
 		return
 	}
 
-	// 3. Consultar API de Mercado Pago (Validación real)
+	// 2. BUSCAR AL USUARIO POR SU ID DE MERCADO PAGO
+	// Aquí está la magia: Buscamos quién tiene este ID vinculado en Mongo
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var user models.User
+	err := database.UserCollection.FindOne(ctx, bson.M{"mpAccount.userId": req.UserID}).Decode(&user)
+
+	if err != nil {
+		// Si no encontramos al usuario, respondemos 200 (OK) para que MP no reintente,
+		// pero logueamos el error.
+		fmt.Printf("⚠️ Usuario no encontrado para MP User ID: %d\n", req.UserID)
+		c.JSON(http.StatusOK, gin.H{"message": "Usuario no encontrado, evento ignorado"})
+		return
+	}
+
+	// 3. Consultar API de Mercado Pago
 	client := &http.Client{Timeout: 10 * time.Second}
 	mpURL := fmt.Sprintf("https://api.mercadopago.com/v1/payments/%s", req.Data.ID)
 
 	mpReq, err := http.NewRequest("GET", mpURL, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create MP request"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error creando request"})
 		return
 	}
 
-	// Usamos el token del Vendedor (Usuario)
 	mpReq.Header.Set("Authorization", "Bearer "+user.MPAccount.AccessToken)
 
 	resp, err := client.Do(mpReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to contact Mercado Pago"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Error contactando a MP"})
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		c.JSON(http.StatusOK, gin.H{"error": "Mercado Pago returned error or payment not found"})
+		// Esto pasará con el ID falso "123456789" del simulador
+		fmt.Println("❌ Mercado Pago devolvió error al consultar el pago (Probablemente ID falso)")
+		c.JSON(http.StatusOK, gin.H{"error": "No se pudo obtener detalle del pago"})
 		return
 	}
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	var payment PaymentResponse
 	if err := json.Unmarshal(bodyBytes, &payment); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse MP response"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error parseando pago"})
 		return
 	}
 
-	// 4. Lógica de Negocio (Solo Aprobados y Dinero en Cuenta/Transferencia)
+	// 4. Validar que sea Aprobado
 	if payment.Status != "approved" {
-		c.JSON(http.StatusOK, gin.H{"message": "Payment not approved, ignored"})
+		c.JSON(http.StatusOK, gin.H{"message": "Pago no aprobado, ignorado"})
 		return
 	}
 
-	// Filtro opcional: Solo aceptar transferencias (account_money)
-	// Si quieres aceptar tarjeta de débito/crédito, comenta este if.
-	if payment.PaymentMethodID != "account_money" {
-		// c.JSON(http.StatusOK, gin.H{"message": "Payment method not account_money, ignored"})
-		// return
+	// 5. Evitar Duplicados
+	count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{"mpPaymentId": payment.ID})
+	if count > 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "El pago ya fue procesado anteriormente"})
+		return
 	}
 
-	// 5. Guardar en Colección MPPayments (Historial crudo)
-	// Parsear fecha con seguridad
+	// 6. Guardar el Registro Crudo
 	receivedAt, err := time.Parse(time.RFC3339, payment.DateCreated)
 	if err != nil {
-		receivedAt = time.Now() // Fallback si la fecha viene rara
+		receivedAt = time.Now()
 	}
 
 	mpPayment := models.MPPayment{
 		ID:          primitive.NewObjectID(),
-		UserID:      userID,
+		UserID:      user.ID, // Usamos el ID del usuario que encontramos en la DB
 		MPPaymentID: payment.ID,
 		Amount:      payment.TransactionAmount,
 		PayerEmail:  payment.Payer.Email,
@@ -251,27 +232,20 @@ func HandleMPWebhook(c *gin.Context) {
 		RawResponse: string(bodyBytes),
 	}
 
-	// Evitar duplicados (Idempotencia)
-	count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{"mpPaymentId": payment.ID})
-	if count > 0 {
-		c.JSON(http.StatusOK, gin.H{"message": "Payment already processed"})
-		return
-	}
-
 	_, err = database.MPPaymentsCollection.InsertOne(ctx, mpPayment)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save payment record"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error guardando pago"})
 		return
 	}
 
-	// 6. Crear Venta (Sell) en el sistema
+	// 7. Crear la Venta
 	sell := models.Sell{
 		ID:       primitive.NewObjectID(),
-		UserID:   userID,
+		UserID:   user.ID,
 		Amount:   payment.TransactionAmount,
 		Date:     time.Now(),
-		Type:     "transfer", // Asegúrate de que este string coincida con tu frontend
-		Comments: fmt.Sprintf("Transferencia MP #%d de %s", payment.ID, payment.Payer.Email),
+		Type:     "transfer",
+		Comments: fmt.Sprintf("MP Transfer #%d - %s", payment.ID, payment.Payer.Email),
 		Modified: false,
 		IsClosed: false,
 		History:  []models.SellHistory{},
@@ -279,8 +253,8 @@ func HandleMPWebhook(c *gin.Context) {
 
 	_, err = database.SellsCollection.InsertOne(ctx, sell)
 	if err != nil {
-		fmt.Printf("⚠️ Error creating sell for payment %d: %v\n", payment.ID, err)
+		fmt.Printf("⚠️ Error creando venta: %v\n", err)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Payment processed and sell created"})
+	c.JSON(http.StatusOK, gin.H{"message": "Pago procesado exitosamente"})
 }
