@@ -95,6 +95,7 @@ func main() {
 
 	// Webhooks
 	router.POST("/webhooks/mercadopago", handlers.HandleMPWebhook)
+	router.GET("/payments", middleware.AuthMiddleware(), handlers.GetMPPaymentsHandler)
 
 	// Grupo User (Protegido)
 	userGroup := router.Group("/user")
