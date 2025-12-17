@@ -152,15 +152,17 @@ func AdminCreateUserHandler(c *gin.Context) {
 		return
 	}
 
-	var user models.User
-	if err := c.ShouldBindJSON(&user); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos"})
-		return
+	// ✅ SOLUCIÓN: Usamos una estructura auxiliar para recibir los datos
+	// Esto permite leer el "password" del JSON aunque el modelo User lo tenga oculto.
+	var input struct {
+		Username string `json:"username" binding:"required"`
+		Email    string `json:"email" binding:"required"`
+		Password string `json:"password" binding:"required"`
 	}
 
-	// Basic validation
-	if user.Email == "" || user.Password == "" || user.Username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Email, usuario y contraseña son requeridos"})
+	// BindJSON ahora usa 'input' en vez de 'user'
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Faltan datos: Email, usuario y contraseña son requeridos"})
 		return
 	}
 
@@ -169,30 +171,32 @@ func AdminCreateUserHandler(c *gin.Context) {
 
 	// Check if user already exists
 	var existing models.User
-	err := database.UserCollection.FindOne(ctx, bson.M{"email": user.Email}).Decode(&existing)
+	err := database.UserCollection.FindOne(ctx, bson.M{"email": input.Email}).Decode(&existing)
 	if err == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "El email ya está registrado"})
 		return
 	}
 
-	// Encrypt password
-	hash, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
+	// Encrypt password (Usamos input.Password)
+	hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al procesar contraseña"})
 		return
 	}
-	user.Password = string(hash)
 
-	// Set default preferences if missing
-	if user.Theme == "" {
-		user.Theme = "light"
-	}
-	if user.Language == "" {
-		user.Language = "es"
+	// Creamos el modelo User real manualmente
+	newUser := models.User{
+		ID:       primitive.NewObjectID(),
+		Email:    input.Email,
+		Username: input.Username,
+		Password: string(hash), // Guardamos el hash
+		Theme:    "light",      // Valores por defecto
+		Language: "es",
+		// MPAccount queda vacío/nil por defecto
 	}
 
 	// Save to database
-	res, err := database.UserCollection.InsertOne(ctx, user)
+	res, err := database.UserCollection.InsertOne(ctx, newUser)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al registrar usuario"})
 		return
