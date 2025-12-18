@@ -37,7 +37,7 @@ type MPSearchResponse struct {
 }
 
 func SyncMPTransfersHandler(c *gin.Context) {
-	// 1. Obtener usuario autenticado
+	// 1. Obtener usuario (Igual que antes)
 	userIDStr, exists := c.Get("userId")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
@@ -48,7 +48,6 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 2. Obtener Token del usuario
 	var user models.User
 	err := database.UserCollection.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
 	if err != nil || user.MPAccount == nil {
@@ -56,40 +55,37 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 3. Preparar Rango de Fechas (HOY en Argentina) 🇦🇷
-	// Definimos la zona horaria manual (GMT-3) para no depender de la hora del servidor (que suele ser UTC)
-	loc := time.FixedZone("ART", -3*60*60)
-	now := time.Now().In(loc)
+	// 2. ESTRATEGIA: "RED DE PESCA GRANDE" (Últimos 3 días) 📅
+	// Esto evita problemas de Timezone. Pedimos todo lo reciente.
+	endTime := time.Now()
+	startTime := endTime.Add(-72 * time.Hour) // Miramos 3 días atrás
 
-	// Inicio del día: 00:00:00
-	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	// Fin del día: 23:59:59
-	endOfDay := startOfDay.Add(24 * time.Hour).Add(-1 * time.Second)
+	// Formato RFC3339 (ISO 8601)
+	beginDateISO := startTime.Format(time.RFC3339)
+	endDateISO := endTime.Format(time.RFC3339)
 
-	// Formato ISO 8601 (RFC3339) que pide Mercado Pago
-	beginDateISO := startOfDay.Format(time.RFC3339)
-	endDateISO := endOfDay.Format(time.RFC3339)
-
-	// 4. Construir URL de Mercado Pago con filtros
+	// 3. Construir URL
 	baseURL := "https://api.mercadopago.com/v1/payments/search"
 
-	// Usamos url.Values para armar los parámetros de forma segura
 	params := url.Values{}
 	params.Add("status", "approved")
-	params.Add("payment_type_id", "bank_transfer")
 	params.Add("sort", "date_created")
 	params.Add("criteria", "desc")
-	params.Add("limit", "100") // ✅ Aumentamos el límite a 100 para traer todo el día si hubo muchas ventas
+	params.Add("limit", "50")
 
-	// ✅ Filtros de FECHA (Rango: date_created)
+	// ⚠️ QUITAMOS TEMPORALMENTE el filtro estricto de tipo para probar
+	// params.Add("payment_type_id", "bank_transfer")
+
+	// Filtros de fecha
 	params.Add("range", "date_created")
 	params.Add("begin_date", beginDateISO)
 	params.Add("end_date", endDateISO)
 
-	// La URL final queda limpia y segura
 	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
-	// 5. Consultar a Mercado Pago
+	// LOG DE DEBUG: Ver qué estamos pidiendo en los logs de Render
+	fmt.Printf("🔍 Sincronizando: %s\n", finalURL)
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", finalURL, nil)
 	req.Header.Set("Authorization", "Bearer "+user.MPAccount.AccessToken)
@@ -103,6 +99,15 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 	var searchResult MPSearchResponse
 	bodyBytes, _ := io.ReadAll(resp.Body)
+
+	// LOG DE DEBUG: Ver qué respondió MP (Primeros 200 caracteres para no ensuciar)
+	respString := string(bodyBytes)
+	if len(respString) > 200 {
+		fmt.Printf("📦 Respuesta MP: %s...\n", respString[:200])
+	} else {
+		fmt.Printf("📦 Respuesta MP: %s\n", respString)
+	}
+
 	if err := json.Unmarshal(bodyBytes, &searchResult); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error leyendo respuesta de MP"})
 		return
@@ -110,32 +115,30 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 	newCount := 0
 
-	// 6. Procesar resultados
+	// 4. Procesar resultados
 	for _, payment := range searchResult.Results {
 
 		// Verificar duplicados
 		count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{"mpPaymentId": payment.ID})
 		if count > 0 {
+			// LOG DE DEBUG: Ver qué estamos saltando
+			// fmt.Printf("⏭️ Saltando pago %d (Ya existe)\n", payment.ID)
 			continue
 		}
 
-		// --- LÓGICA DE DETECCIÓN DE NOMBRE ---
+		// Lógica de Nombre
 		finalName := "Desconocido"
-
 		if payment.Payer.FirstName != "" || payment.Payer.LastName != "" {
 			finalName = strings.TrimSpace(fmt.Sprintf("%s %s", payment.Payer.FirstName, payment.Payer.LastName))
 		}
-
 		if finalName == "Desconocido" || finalName == "" {
 			if payment.Description != "" && payment.Description != "null" {
 				finalName = payment.Description
 			}
 		}
-
 		if finalName == "Desconocido" || finalName == "" {
 			finalName = payment.Payer.Email
 		}
-		// -------------------------------------
 
 		receivedAt, _ := time.Parse(time.RFC3339, payment.DateCreated)
 
@@ -154,7 +157,6 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 		database.MPPaymentsCollection.InsertOne(ctx, mpPayment)
 
-		// Crear Venta
 		sell := models.Sell{
 			ID:       primitive.NewObjectID(),
 			UserID:   user.ID,
@@ -169,10 +171,11 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		database.SellsCollection.InsertOne(ctx, sell)
 
 		newCount++
+		fmt.Printf("✅ Guardado nuevo pago: %d - %s\n", payment.ID, finalName)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización del día completada. %d nuevas transferencias.", newCount),
+		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias.", newCount),
 		"new":     newCount,
 	})
 }
