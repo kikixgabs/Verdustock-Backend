@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url" // ✅ Importante: Agregado para construir la URL segura con fechas
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// Estructura EXTENDIDA (Igual que antes)
+// Estructura EXTENDIDA
 type ExtendedPaymentResponse struct {
 	ID                int64   `json:"id"`
 	Status            string  `json:"status"`
@@ -37,7 +37,7 @@ type MPSearchResponse struct {
 }
 
 func SyncMPTransfersHandler(c *gin.Context) {
-	// 1. Obtener usuario (Igual que antes)
+	// 1. Obtener usuario
 	userIDStr, exists := c.Get("userId")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
@@ -55,12 +55,10 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 2. ESTRATEGIA: "RED DE PESCA GRANDE" (Últimos 3 días) 📅
-	// Esto evita problemas de Timezone. Pedimos todo lo reciente.
+	// 2. ESTRATEGIA: "RED DE PESCA GRANDE" (Últimos 3 días)
 	endTime := time.Now()
-	startTime := endTime.Add(-72 * time.Hour) // Miramos 3 días atrás
+	startTime := endTime.Add(-72 * time.Hour)
 
-	// Formato RFC3339 (ISO 8601)
 	beginDateISO := startTime.Format(time.RFC3339)
 	endDateISO := endTime.Format(time.RFC3339)
 
@@ -73,17 +71,15 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	params.Add("criteria", "desc")
 	params.Add("limit", "50")
 
-	// ⚠️ QUITAMOS TEMPORALMENTE el filtro estricto de tipo para probar
+	// NOTA: Mantenemos el filtro de tipo desactivado para asegurar que entra todo
 	// params.Add("payment_type_id", "bank_transfer")
 
-	// Filtros de fecha
 	params.Add("range", "date_created")
 	params.Add("begin_date", beginDateISO)
 	params.Add("end_date", endDateISO)
 
 	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
 
-	// LOG DE DEBUG: Ver qué estamos pidiendo en los logs de Render
 	fmt.Printf("🔍 Sincronizando: %s\n", finalURL)
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -100,7 +96,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	var searchResult MPSearchResponse
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
-	// LOG DE DEBUG: Ver qué respondió MP (Primeros 200 caracteres para no ensuciar)
+	// Debug logs
 	respString := string(bodyBytes)
 	if len(respString) > 200 {
 		fmt.Printf("📦 Respuesta MP: %s...\n", respString[:200])
@@ -118,11 +114,15 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	// 4. Procesar resultados
 	for _, payment := range searchResult.Results {
 
-		// Verificar duplicados
-		count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{"mpPaymentId": payment.ID})
+		// ✅✅✅ AQUÍ ESTÁ EL CAMBIO CRÍTICO ✅✅✅
+		// Ahora verificamos ID del Pago Y ID del Usuario al mismo tiempo.
+		count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{
+			"mpPaymentId": payment.ID,
+			"userId":      user.ID, // <--- ESTA LÍNEA SOLUCIONA EL "FANTASMA"
+		})
+
 		if count > 0 {
-			// LOG DE DEBUG: Ver qué estamos saltando
-			// fmt.Printf("⏭️ Saltando pago %d (Ya existe)\n", payment.ID)
+			// Si ESTE usuario ya tiene el pago, lo saltamos.
 			continue
 		}
 
