@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings" // Agregamos strings para limpiar texto
+	"net/url" // ✅ Importante: Agregado para construir la URL segura con fechas
+	"strings"
 	"time"
 
 	"verdustock-auth/database"
@@ -17,24 +18,22 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// Definimos una estructura EXTENDIDA solo para este archivo.
-// Esto asegura que leamos los campos de nombre sin romper el otro archivo.
+// Estructura EXTENDIDA (Igual que antes)
 type ExtendedPaymentResponse struct {
 	ID                int64   `json:"id"`
 	Status            string  `json:"status"`
 	TransactionAmount float64 `json:"transaction_amount"`
 	DateCreated       string  `json:"date_created"`
-	Description       string  `json:"description"` // ✅ Aquí suele venir el nombre en transferencias
+	Description       string  `json:"description"`
 	Payer             struct {
 		Email     string `json:"email"`
-		FirstName string `json:"first_name"` // ✅ Leemos nombre
-		LastName  string `json:"last_name"`  // ✅ Leemos apellido
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
 	} `json:"payer"`
 }
 
-// Estructura para la respuesta de búsqueda de MP
 type MPSearchResponse struct {
-	Results []ExtendedPaymentResponse `json:"results"` // Usamos la estructura extendida
+	Results []ExtendedPaymentResponse `json:"results"`
 }
 
 func SyncMPTransfersHandler(c *gin.Context) {
@@ -57,13 +56,42 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 3. Consultar a Mercado Pago
+	// 3. Preparar Rango de Fechas (HOY en Argentina) 🇦🇷
+	// Definimos la zona horaria manual (GMT-3) para no depender de la hora del servidor (que suele ser UTC)
+	loc := time.FixedZone("ART", -3*60*60)
+	now := time.Now().In(loc)
+
+	// Inicio del día: 00:00:00
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	// Fin del día: 23:59:59
+	endOfDay := startOfDay.Add(24 * time.Hour).Add(-1 * time.Second)
+
+	// Formato ISO 8601 (RFC3339) que pide Mercado Pago
+	beginDateISO := startOfDay.Format(time.RFC3339)
+	endDateISO := endOfDay.Format(time.RFC3339)
+
+	// 4. Construir URL de Mercado Pago con filtros
+	baseURL := "https://api.mercadopago.com/v1/payments/search"
+
+	// Usamos url.Values para armar los parámetros de forma segura
+	params := url.Values{}
+	params.Add("status", "approved")
+	params.Add("payment_type_id", "bank_transfer")
+	params.Add("sort", "date_created")
+	params.Add("criteria", "desc")
+	params.Add("limit", "100") // ✅ Aumentamos el límite a 100 para traer todo el día si hubo muchas ventas
+
+	// ✅ Filtros de FECHA (Rango: date_created)
+	params.Add("range", "date_created")
+	params.Add("begin_date", beginDateISO)
+	params.Add("end_date", endDateISO)
+
+	// La URL final queda limpia y segura
+	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	// 5. Consultar a Mercado Pago
 	client := &http.Client{Timeout: 10 * time.Second}
-
-	// Filtros: approved y bank_transfer
-	mpURL := "https://api.mercadopago.com/v1/payments/search?status=approved&payment_type_id=bank_transfer&sort=date_created&criteria=desc&limit=20"
-
-	req, _ := http.NewRequest("GET", mpURL, nil)
+	req, _ := http.NewRequest("GET", finalURL, nil)
 	req.Header.Set("Authorization", "Bearer "+user.MPAccount.AccessToken)
 
 	resp, err := client.Do(req)
@@ -82,31 +110,28 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 	newCount := 0
 
-	// 4. Procesar resultados
+	// 6. Procesar resultados
 	for _, payment := range searchResult.Results {
 
-		// Verificar si ya existe en nuestra DB
+		// Verificar duplicados
 		count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{"mpPaymentId": payment.ID})
 		if count > 0 {
-			continue // Ya lo tenemos, saltar
+			continue
 		}
 
 		// --- LÓGICA DE DETECCIÓN DE NOMBRE ---
 		finalName := "Desconocido"
 
-		// Intento A: Nombre y Apellido del objeto Payer
 		if payment.Payer.FirstName != "" || payment.Payer.LastName != "" {
 			finalName = strings.TrimSpace(fmt.Sprintf("%s %s", payment.Payer.FirstName, payment.Payer.LastName))
 		}
 
-		// Intento B: Si falló A, usar la Descripción (Ej: "Transferencia de Maria...")
 		if finalName == "Desconocido" || finalName == "" {
 			if payment.Description != "" && payment.Description != "null" {
 				finalName = payment.Description
 			}
 		}
 
-		// Intento C: Si todo falló, usar Email
 		if finalName == "Desconocido" || finalName == "" {
 			finalName = payment.Payer.Email
 		}
@@ -120,7 +145,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			MPPaymentID: payment.ID,
 			Amount:      payment.TransactionAmount,
 			PayerEmail:  payment.Payer.Email,
-			PayerName:   finalName, // ✅ Guardamos el nombre detectado
+			PayerName:   finalName,
 			Status:      payment.Status,
 			ReceivedAt:  receivedAt,
 			Source:      "SYNC_CVU",
@@ -136,7 +161,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			Amount:   payment.TransactionAmount,
 			Date:     time.Now(),
 			Type:     "transfer",
-			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID), // ✅ Nombre en comentario
+			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID),
 			Modified: false,
 			IsClosed: false,
 			History:  []models.SellHistory{},
@@ -147,7 +172,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias.", newCount),
+		"message": fmt.Sprintf("Sincronización del día completada. %d nuevas transferencias.", newCount),
 		"new":     newCount,
 	})
 }
