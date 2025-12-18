@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings" // Agregamos strings para limpiar texto
 	"time"
 
 	"verdustock-auth/database"
@@ -16,9 +17,24 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
+// Definimos una estructura EXTENDIDA solo para este archivo.
+// Esto asegura que leamos los campos de nombre sin romper el otro archivo.
+type ExtendedPaymentResponse struct {
+	ID                int64   `json:"id"`
+	Status            string  `json:"status"`
+	TransactionAmount float64 `json:"transaction_amount"`
+	DateCreated       string  `json:"date_created"`
+	Description       string  `json:"description"` // ✅ Aquí suele venir el nombre en transferencias
+	Payer             struct {
+		Email     string `json:"email"`
+		FirstName string `json:"first_name"` // ✅ Leemos nombre
+		LastName  string `json:"last_name"`  // ✅ Leemos apellido
+	} `json:"payer"`
+}
+
 // Estructura para la respuesta de búsqueda de MP
 type MPSearchResponse struct {
-	Results []PaymentResponse `json:"results"`
+	Results []ExtendedPaymentResponse `json:"results"` // Usamos la estructura extendida
 }
 
 func SyncMPTransfersHandler(c *gin.Context) {
@@ -41,10 +57,10 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 3. Consultar a Mercado Pago: "Dame las últimas transferencias aprobadas"
+	// 3. Consultar a Mercado Pago
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	// Filtros CLAVE: status=approved Y payment_type_id=bank_transfer
+	// Filtros: approved y bank_transfer
 	mpURL := "https://api.mercadopago.com/v1/payments/search?status=approved&payment_type_id=bank_transfer&sort=date_created&criteria=desc&limit=20"
 
 	req, _ := http.NewRequest("GET", mpURL, nil)
@@ -66,7 +82,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 	newCount := 0
 
-	// 4. Procesar resultados y guardar solo los NUEVOS
+	// 4. Procesar resultados
 	for _, payment := range searchResult.Results {
 
 		// Verificar si ya existe en nuestra DB
@@ -75,7 +91,27 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			continue // Ya lo tenemos, saltar
 		}
 
-		// Si es nuevo, lo guardamos (Misma lógica que el Webhook)
+		// --- LÓGICA DE DETECCIÓN DE NOMBRE ---
+		finalName := "Desconocido"
+
+		// Intento A: Nombre y Apellido del objeto Payer
+		if payment.Payer.FirstName != "" || payment.Payer.LastName != "" {
+			finalName = strings.TrimSpace(fmt.Sprintf("%s %s", payment.Payer.FirstName, payment.Payer.LastName))
+		}
+
+		// Intento B: Si falló A, usar la Descripción (Ej: "Transferencia de Maria...")
+		if finalName == "Desconocido" || finalName == "" {
+			if payment.Description != "" && payment.Description != "null" {
+				finalName = payment.Description
+			}
+		}
+
+		// Intento C: Si todo falló, usar Email
+		if finalName == "Desconocido" || finalName == "" {
+			finalName = payment.Payer.Email
+		}
+		// -------------------------------------
+
 		receivedAt, _ := time.Parse(time.RFC3339, payment.DateCreated)
 
 		mpPayment := models.MPPayment{
@@ -84,9 +120,10 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			MPPaymentID: payment.ID,
 			Amount:      payment.TransactionAmount,
 			PayerEmail:  payment.Payer.Email,
+			PayerName:   finalName, // ✅ Guardamos el nombre detectado
 			Status:      payment.Status,
 			ReceivedAt:  receivedAt,
-			Source:      "SYNC_CVU", // Marcamos que vino por Sincronización
+			Source:      "SYNC_CVU",
 			RawResponse: "",
 		}
 
@@ -99,7 +136,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			Amount:   payment.TransactionAmount,
 			Date:     time.Now(),
 			Type:     "transfer",
-			Comments: fmt.Sprintf("Transferencia CVU detectada #%d", payment.ID),
+			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID), // ✅ Nombre en comentario
 			Modified: false,
 			IsClosed: false,
 			History:  []models.SellHistory{},
@@ -110,7 +147,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias detectadas.", newCount),
+		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias.", newCount),
 		"new":     newCount,
 	})
 }
