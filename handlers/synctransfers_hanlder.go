@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type ExtendedPaymentResponse struct {
 	TransactionAmount float64 `json:"transaction_amount"`
 	DateCreated       string  `json:"date_created"`
 	Description       string  `json:"description"`
+	PaymentTypeID     string  `json:"payment_type_id"` // ✅ Agregamos esto para verificar
 	Payer             struct {
 		Email     string `json:"email"`
 		FirstName string `json:"first_name"`
@@ -54,25 +56,33 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 🛑 ESTRATEGIA NUCLEAR: SIN FECHAS ☢️
-	// Eliminamos range, begin_date y end_date.
-	// Pedimos simplemente los últimos 50 pagos aprobados de la historia de esta cuenta.
+	// 2. CONFIGURACIÓN FINAL: ÚLTIMOS 3 DÍAS + SOLO TRANSFERENCIAS
+	// Miramos 72hs atrás para cubrir fines de semana o días anteriores sin cerrar caja.
+
+	loc := time.FixedZone("ART", -3*60*60)
+	endTime := time.Now().In(loc)
+	startTime := endTime.Add(-72 * time.Hour)
+
+	beginDateISO := startTime.Format(time.RFC3339)
+	endDateISO := endTime.Format(time.RFC3339)
 
 	baseURL := "https://api.mercadopago.com/v1/payments/search"
 
-	// Construcción manual simple para evitar errores de codificación
-	// sort=date_created&criteria=desc -> Trae los más nuevos primero
-	finalURL := fmt.Sprintf("%s?status=approved&sort=date_created&criteria=desc&limit=50", baseURL)
+	params := url.Values{}
+	params.Add("status", "approved")
+	params.Add("sort", "date_created")
+	params.Add("criteria", "desc")
+	params.Add("limit", "100")
 
-	// LOG DE DEBUG IMPORTANTE:
-	// Muestra los últimos 5 caracteres del Token para que verifiques si es la cuenta correcta
-	token := user.MPAccount.AccessToken
-	maskedToken := "..."
-	if len(token) > 5 {
-		maskedToken = token[len(token)-5:]
-	}
-	fmt.Printf("🔍 Sincronizando Cuenta (Token termina en: %s)\n", maskedToken)
-	fmt.Printf("🌍 URL: %s\n", finalURL)
+	// ✅ FILTROS ACTIVADOS (Adiós HBO Max)
+	params.Add("payment_type_id", "bank_transfer") // Solo transferencias CVU
+	params.Add("range", "date_created")
+	params.Add("begin_date", beginDateISO)
+	params.Add("end_date", endDateISO)
+
+	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+
+	fmt.Printf("🔍 Sincronizando (Filtro Transferencias): %s\n", finalURL)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", finalURL, nil)
@@ -86,15 +96,6 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
-
-	// LOG PARA VER SI MP DEVUELVE ALGO VACÍO
-	respStr := string(bodyBytes)
-	if len(respStr) > 500 {
-		fmt.Printf("📦 Respuesta MP (RAW): %s... \n", respStr[:500])
-	} else {
-		fmt.Printf("📦 Respuesta MP (RAW): %s \n", respStr)
-	}
-
 	var searchResult MPSearchResponse
 	if err := json.Unmarshal(bodyBytes, &searchResult); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error leyendo respuesta de MP"})
@@ -103,7 +104,6 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 	newCount := 0
 
-	// 4. Procesar resultados
 	for _, payment := range searchResult.Results {
 
 		// Verificar duplicados (ID Pago + ID Usuario)
@@ -130,7 +130,8 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			finalName = payment.Payer.Email
 		}
 
-		receivedAt, _ := time.Parse(time.RFC3339, payment.DateCreated)
+		// Parsear la fecha REAL de la transferencia
+		realDate, _ := time.Parse(time.RFC3339, payment.DateCreated)
 
 		mpPayment := models.MPPayment{
 			ID:          primitive.NewObjectID(),
@@ -140,7 +141,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			PayerEmail:  payment.Payer.Email,
 			PayerName:   finalName,
 			Status:      payment.Status,
-			ReceivedAt:  receivedAt,
+			ReceivedAt:  realDate, // ✅ Guardamos la fecha real
 			Source:      "SYNC_CVU",
 			RawResponse: "",
 		}
@@ -149,10 +150,15 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 		// Crear Venta
 		sell := models.Sell{
-			ID:       primitive.NewObjectID(),
-			UserID:   user.ID,
-			Amount:   payment.TransactionAmount,
-			Date:     time.Now(), // Usamos fecha actual para que aparezca arriba en la lista
+			ID:     primitive.NewObjectID(),
+			UserID: user.ID,
+			Amount: payment.TransactionAmount,
+
+			// ✅ IMPORTANTE: Usamos la fecha REAL.
+			// Si la transferencia fue ayer, aparecerá en la caja de ayer.
+			// Si quieres que aparezca SIEMPRE HOY, cambia esto por time.Now()
+			Date: realDate,
+
 			Type:     "Transferencia",
 			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID),
 			Modified: false,
@@ -162,11 +168,11 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		database.SellsCollection.InsertOne(ctx, sell)
 
 		newCount++
-		fmt.Printf("✅ RECUPERADO: %d - %s ($%.2f)\n", payment.ID, finalName, payment.TransactionAmount)
+		fmt.Printf("✅ Guardado: %s - %s ($%.2f)\n", payment.DateCreated, finalName, payment.TransactionAmount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización Nuclear completada. %d pagos recuperados.", newCount),
+		"message": fmt.Sprintf("Sincronización completada. %d transferencias procesadas.", newCount),
 		"new":     newCount,
 	})
 }
