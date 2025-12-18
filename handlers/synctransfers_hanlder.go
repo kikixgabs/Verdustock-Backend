@@ -55,22 +55,15 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 2. ESTRATEGIA: "SOLO HOY ARGENTINA" 🇦🇷
-	// Volvemos a la precisión quirúrgica ahora que arreglamos el bug del usuario.
+	// 2. ESTRATEGIA: "RED DE PESCA GRANDE" (Últimos 3 días) 🎣
+	// Volvemos a mirar atrás para recuperar las transferencias de ayer (Dec 17)
 
-	// Definimos la zona horaria manual (GMT-3)
 	loc := time.FixedZone("ART", -3*60*60)
-	now := time.Now().In(loc)
+	endTime := time.Now().In(loc)
+	startTime := endTime.Add(-72 * time.Hour) // <-- CLAVE: Miramos 3 días atrás
 
-	// Inicio del día de HOY: 00:00:00
-	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-
-	// Fin del día (por si acaso): 23:59:59
-	endOfDay := startOfDay.Add(24 * time.Hour).Add(-1 * time.Second)
-
-	// Formato ISO 8601 (RFC3339) para Mercado Pago
-	beginDateISO := startOfDay.Format(time.RFC3339)
-	endDateISO := endOfDay.Format(time.RFC3339)
+	beginDateISO := startTime.Format(time.RFC3339)
+	endDateISO := endTime.Format(time.RFC3339)
 
 	// 3. Construir URL
 	baseURL := "https://api.mercadopago.com/v1/payments/search"
@@ -79,9 +72,9 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	params.Add("status", "approved")
 	params.Add("sort", "date_created")
 	params.Add("criteria", "desc")
-	params.Add("limit", "100") // Traemos hasta 100 movimientos del día
+	params.Add("limit", "100")
 
-	// Filtros de fecha ESTRICTOS
+	// Filtros de fecha AMPLIOS
 	params.Add("range", "date_created")
 	params.Add("begin_date", beginDateISO)
 	params.Add("end_date", endDateISO)
@@ -156,13 +149,13 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 		database.MPPaymentsCollection.InsertOne(ctx, mpPayment)
 
-		// ✅ CORRECCIÓN DE TIPO: Usamos "Transferencia" para coincidir con tu Enum de Angular
+		// Crear Venta
 		sell := models.Sell{
 			ID:       primitive.NewObjectID(),
 			UserID:   user.ID,
 			Amount:   payment.TransactionAmount,
-			Date:     time.Now(),
-			Type:     "Transferencia", // <--- CAMBIO AQUÍ (Antes era "transfer")
+			Date:     time.Now(),      // Usamos fecha actual para que entre en la caja de "Hoy"
+			Type:     "Transferencia", // ✅ Corregido a Mayúscula
 			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID),
 			Modified: false,
 			IsClosed: false,
@@ -175,7 +168,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización del día completada. %d nuevas transferencias.", newCount),
+		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias recuperadas.", newCount),
 		"new":     newCount,
 	})
 }
