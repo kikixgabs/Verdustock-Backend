@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -55,34 +54,25 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 2. ESTRATEGIA: "RED DE PESCA GRANDE" (Últimos 3 días) 🎣
-	// Volvemos a mirar atrás para recuperar las transferencias de ayer (Dec 17)
+	// 🛑 ESTRATEGIA NUCLEAR: SIN FECHAS ☢️
+	// Eliminamos range, begin_date y end_date.
+	// Pedimos simplemente los últimos 50 pagos aprobados de la historia de esta cuenta.
 
-	loc := time.FixedZone("ART", -3*60*60)
-	endTime := time.Now().In(loc)
-	startTime := endTime.Add(-72 * time.Hour) // <-- CLAVE: Miramos 3 días atrás
-
-	beginDateISO := startTime.Format(time.RFC3339)
-	endDateISO := endTime.Format(time.RFC3339)
-
-	// 3. Construir URL
 	baseURL := "https://api.mercadopago.com/v1/payments/search"
 
-	params := url.Values{}
-	params.Add("status", "approved")
-	params.Add("sort", "date_created")
-	params.Add("criteria", "desc")
-	params.Add("limit", "100")
+	// Construcción manual simple para evitar errores de codificación
+	// sort=date_created&criteria=desc -> Trae los más nuevos primero
+	finalURL := fmt.Sprintf("%s?status=approved&sort=date_created&criteria=desc&limit=50", baseURL)
 
-	// Filtros de fecha AMPLIOS
-	params.Add("range", "date_created")
-	params.Add("begin_date", beginDateISO)
-	params.Add("end_date", endDateISO)
-
-	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-
-	// Debug
-	fmt.Printf("🔍 Sincronizando (Desde %s hasta %s)\n", beginDateISO, endDateISO)
+	// LOG DE DEBUG IMPORTANTE:
+	// Muestra los últimos 5 caracteres del Token para que verifiques si es la cuenta correcta
+	token := user.MPAccount.AccessToken
+	maskedToken := "..."
+	if len(token) > 5 {
+		maskedToken = token[len(token)-5:]
+	}
+	fmt.Printf("🔍 Sincronizando Cuenta (Token termina en: %s)\n", maskedToken)
+	fmt.Printf("🌍 URL: %s\n", finalURL)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", finalURL, nil)
@@ -95,9 +85,17 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	var searchResult MPSearchResponse
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
+	// LOG PARA VER SI MP DEVUELVE ALGO VACÍO
+	respStr := string(bodyBytes)
+	if len(respStr) > 500 {
+		fmt.Printf("📦 Respuesta MP (RAW): %s... \n", respStr[:500])
+	} else {
+		fmt.Printf("📦 Respuesta MP (RAW): %s \n", respStr)
+	}
+
+	var searchResult MPSearchResponse
 	if err := json.Unmarshal(bodyBytes, &searchResult); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error leyendo respuesta de MP"})
 		return
@@ -154,8 +152,8 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			ID:       primitive.NewObjectID(),
 			UserID:   user.ID,
 			Amount:   payment.TransactionAmount,
-			Date:     time.Now(),      // Usamos fecha actual para que entre en la caja de "Hoy"
-			Type:     "Transferencia", // ✅ Corregido a Mayúscula
+			Date:     time.Now(), // Usamos fecha actual para que aparezca arriba en la lista
+			Type:     "Transferencia",
 			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID),
 			Modified: false,
 			IsClosed: false,
@@ -164,11 +162,11 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		database.SellsCollection.InsertOne(ctx, sell)
 
 		newCount++
-		fmt.Printf("✅ Guardado: %d - %s ($%.2f)\n", payment.ID, finalName, payment.TransactionAmount)
+		fmt.Printf("✅ RECUPERADO: %d - %s ($%.2f)\n", payment.ID, finalName, payment.TransactionAmount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Sincronización completada. %d nuevas transferencias recuperadas.", newCount),
+		"message": fmt.Sprintf("Sincronización Nuclear completada. %d pagos recuperados.", newCount),
 		"new":     newCount,
 	})
 }
