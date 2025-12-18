@@ -25,7 +25,6 @@ type ExtendedPaymentResponse struct {
 	TransactionAmount float64 `json:"transaction_amount"`
 	DateCreated       string  `json:"date_created"`
 	Description       string  `json:"description"`
-	PaymentTypeID     string  `json:"payment_type_id"` // ✅ Agregamos esto para verificar
 	Payer             struct {
 		Email     string `json:"email"`
 		FirstName string `json:"first_name"`
@@ -56,11 +55,9 @@ func SyncMPTransfersHandler(c *gin.Context) {
 		return
 	}
 
-	// 2. CONFIGURACIÓN FINAL: ÚLTIMOS 3 DÍAS + SOLO TRANSFERENCIAS
-	// Miramos 72hs atrás para cubrir fines de semana o días anteriores sin cerrar caja.
-
-	loc := time.FixedZone("ART", -3*60*60)
-	endTime := time.Now().In(loc)
+	// 2. CONFIGURACIÓN: Traer últimos 3 días (Buffer de seguridad)
+	// No filtramos por fecha exacta aquí, dejamos que entre todo lo reciente.
+	endTime := time.Now()
 	startTime := endTime.Add(-72 * time.Hour)
 
 	beginDateISO := startTime.Format(time.RFC3339)
@@ -74,15 +71,14 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	params.Add("criteria", "desc")
 	params.Add("limit", "100")
 
-	// ✅ FILTROS ACTIVADOS (Adiós HBO Max)
-	params.Add("payment_type_id", "bank_transfer") // Solo transferencias CVU
+	// ⚠️ QUITAMOS 'payment_type_id' porque estaba ocultando transferencias reales.
+	// Usaremos filtros de texto manuales más abajo.
 	params.Add("range", "date_created")
 	params.Add("begin_date", beginDateISO)
 	params.Add("end_date", endDateISO)
 
 	finalURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-
-	fmt.Printf("🔍 Sincronizando (Filtro Transferencias): %s\n", finalURL)
+	fmt.Printf("🔍 Sincronizando: %s\n", finalURL)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", finalURL, nil)
@@ -105,6 +101,18 @@ func SyncMPTransfersHandler(c *gin.Context) {
 	newCount := 0
 
 	for _, payment := range searchResult.Results {
+
+		// 🛑 FILTRO ANTI-GASTOS (HBO, Paramount, etc.)
+		// Si la descripción contiene palabras clave de gastos, LO IGNORAMOS.
+		desc := strings.ToLower(payment.Description)
+		if strings.Contains(desc, "paramount") ||
+			strings.Contains(desc, "hbo") ||
+			strings.Contains(desc, "netflix") ||
+			strings.Contains(desc, "suscripción") ||
+			strings.Contains(desc, "spotify") {
+			// fmt.Printf("🗑️ Ignorando gasto personal: %s\n", payment.Description)
+			continue
+		}
 
 		// Verificar duplicados (ID Pago + ID Usuario)
 		count, _ := database.MPPaymentsCollection.CountDocuments(ctx, bson.M{
@@ -130,7 +138,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			finalName = payment.Payer.Email
 		}
 
-		// Parsear la fecha REAL de la transferencia
+		// Fecha Real
 		realDate, _ := time.Parse(time.RFC3339, payment.DateCreated)
 
 		mpPayment := models.MPPayment{
@@ -141,7 +149,7 @@ func SyncMPTransfersHandler(c *gin.Context) {
 			PayerEmail:  payment.Payer.Email,
 			PayerName:   finalName,
 			Status:      payment.Status,
-			ReceivedAt:  realDate, // ✅ Guardamos la fecha real
+			ReceivedAt:  realDate,
 			Source:      "SYNC_CVU",
 			RawResponse: "",
 		}
@@ -150,15 +158,10 @@ func SyncMPTransfersHandler(c *gin.Context) {
 
 		// Crear Venta
 		sell := models.Sell{
-			ID:     primitive.NewObjectID(),
-			UserID: user.ID,
-			Amount: payment.TransactionAmount,
-
-			// ✅ IMPORTANTE: Usamos la fecha REAL.
-			// Si la transferencia fue ayer, aparecerá en la caja de ayer.
-			// Si quieres que aparezca SIEMPRE HOY, cambia esto por time.Now()
-			Date: realDate,
-
+			ID:       primitive.NewObjectID(),
+			UserID:   user.ID,
+			Amount:   payment.TransactionAmount,
+			Date:     realDate, // Guardamos fecha real
 			Type:     "Transferencia",
 			Comments: fmt.Sprintf("%s (#%d)", finalName, payment.ID),
 			Modified: false,
