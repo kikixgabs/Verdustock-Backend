@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time" // Agregado para configurar el MaxAge de CORS
+	"time"
 
 	"verdustock-auth/database"
 	"verdustock-auth/handlers"
 	"verdustock-auth/middleware"
 
-	"github.com/gin-contrib/cors" // Librería oficial para CORS
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
@@ -23,15 +23,11 @@ func main() {
 		env = "development"
 	}
 
-	// Intentamos cargar archivos .env, pero si fallan (ej. en Render),
-	// seguimos adelante confiando en las variables del sistema.
 	if env == "development" {
 		if err := godotenv.Load(".env.development"); err != nil {
 			log.Println("⚠️ Aviso: No hay .env.development, usando variables de sistema")
 		}
 	} else {
-		// En producción (Render), normalmente no subimos el .env.production,
-		// así que es normal que esto falle.
 		if err := godotenv.Load(".env.production"); err != nil {
 			log.Println("ℹ️ Info: Corriendo con variables de entorno del sistema (Render)")
 		}
@@ -49,7 +45,6 @@ func main() {
 
 	database.Connect(mongoURI, dbName)
 
-	// Inicializar catálogo si está vacío
 	if err := handlers.InitializeCatalog(); err != nil {
 		log.Println("⚠️ Advertencia: No se pudo inicializar el catálogo de productos:", err)
 	}
@@ -57,33 +52,23 @@ func main() {
 	// 3. Configuración del Servidor y CORS
 	router := gin.Default()
 
-	// CONFIGURACIÓN ROBUSTA DE CORS
-	// Esto reemplaza tu función manual anterior.
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{
-		"http://localhost:4200",       // Tu entorno local
-		"https://kikixgabs.github.io", // Tu producción
+		"http://localhost:4200",       // Local
+		"https://kikixgabs.github.io", // Producción
 	}
-	// Métodos permitidos
 	config.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-
-	// Headers permitidos (Agregamos X-Admin-Secret y Accept que faltaban)
 	config.AllowHeaders = []string{
 		"Origin",
 		"Content-Type",
 		"Accept",
 		"Authorization",
 		"X-Requested-With",
-		"X-Admin-Secret", // Necesario para tu script de admin
+		"X-Admin-Secret",
 	}
-
-	// CRÍTICO: Permitir cookies/credenciales
 	config.AllowCredentials = true
-
-	// Cachear la respuesta de preflight por 12 horas para mejorar rendimiento
 	config.MaxAge = 12 * time.Hour
 
-	// Aplicar el middleware
 	router.Use(cors.New(config))
 
 	// 4. Definición de Rutas
@@ -95,8 +80,13 @@ func main() {
 
 	// Webhooks
 	router.POST("/webhooks/mercadopago", handlers.HandleMPWebhook)
+
+	// Rutas de Pagos y Caja (Protegidas)
 	router.GET("/payments", middleware.AuthMiddleware(), handlers.GetMPPaymentsHandler)
 	router.POST("/payments/sync", middleware.AuthMiddleware(), handlers.SyncMPTransfersHandler)
+
+	// ✅ NUEVA RUTA: Verificar cajas pendientes (Solución al error 404)
+	router.GET("/cash/pending", middleware.AuthMiddleware(), handlers.CheckPendingBoxesHandler)
 
 	// Grupo User (Protegido)
 	userGroup := router.Group("/user")
